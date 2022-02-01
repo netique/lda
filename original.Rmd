@@ -1,0 +1,545 @@
+---
+title: "An R Workbook for Topic Modeling with LDA"
+author: ""
+date: "2/25/2019"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+bibliography: bibliography.bib
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+# Introduction
+
+This document is an R companion to the methods note. This document was created using R markdown [@R-rmarkdown]. There is an R markdown file associated with this document that contains the text and code of this document. This R markdown file is named lda-workbook.Rmd and is provided along with the data used within this document and the main article. The data for this document is in the file **you need to create** named equity.csv (see the document **twitter-archiver-readme** in the zip file). If you would like to "Knit" the .Rmd file with this data from your own machine, launch Rstudio and open this .Rmd. file, change the file path to the equity.csv data (see Read Text Data into R section below), and finally click the "knit" button (For further discussion on this see the document named README in the zip file). Note, you may receive an error that you need to install the packages used within this document if they are not already on your machine. It is assumed that the user has R and Rstudio on their machine.
+
+The purpose of this document is to demonstrate how to use Latent Dirichlet Allocation (LDA) for topic modeling in R as well as provide "boilerplate code" for users. Boilerplate code is code that can be used with little or no alteration. The code and figures for topic modeling in R are discussed throughout. The remaining sections of this document, and steps in the process of analyzing text data with LDA in R, are: 
+
+1. Reading text data into R, 
+2. Cleaning the text data, 
+3. Tokenizing text data, removing stopwords, and creating N-grams, 
+4. Creating a document term matrix, 
+5. LDA tuning with ldatuning package, and 
+6. Topic modeling using LDA with the topicmodels package.
+
+# Step 1) Read Text Data into R
+
+Recall, the data for analysis for the main document contained 1,794 tweets that used the hashtag #equity. Below, we read the source tweets into R with the following code chunk below. Note, prior to cleaning there are 2,201 tweets. First, the import function from the rio package [@R-rio] is used to read the equity.csv file that contains the data for this analysis (rio::import is code for using the function in the rio package without using the library(rio) command in R). UTF-8 encoding is specificed. The data is saved to an R object called tweets. The dataset in R is referred to as a dataframe. Second, we add the names of the variables in the dataset to the dataframe by using a vector of names for the variables in the dataset. Third, we remove duplicated tweets that may have resulted in the process of pulling data from twitter. Fourth, we convert the dataframe to a tibble using the dyplr package [@R-dplyr]. A tibble is simply a modern form of a dataframe in R and the data is required to be in a tibble format for the text processing steps below. Lastly, unique IDs are created for each tweet and the columns are renamed to tweetid to align with the code below. Note, if using your own data, you want to be sure to use the variable names for your dataset, specify the encoding for your data, and make use of naming conventions that best describes your document type (e.g., journals vs. tweets). 
+
+```{r}
+# read data with rio package. save to tweets object. (1)
+tweets <- rio::import(here::here("equity.csv"), encoding="UTF-8")
+
+# names for variables in dataset (2)
+names(tweets) <- c("date","tweet", "retweets", "favs", 
+                   "followers", "follows")
+
+# remove duplicated tweets (3)
+tweets = tweets[!duplicated(tweets$tweet),]
+
+# convert to tibble (4)
+tweets <- dplyr::as_tibble(tweets)
+
+# create unique id for each tweet (5)
+tweets <- dplyr::mutate(tweets, id = rownames(tweets))
+
+# rename id to tweetid (6)
+names(tweets) <- c("date","tweet", "retweets", "favs", 
+                   "followers", "follows", "tweetid")
+
+# display data in tibble format
+tweets
+```
+
+We can see that the dataset we are working with contains 1,796 rows and 7 columns. Each row contains a tweet and each column contains an attribute about the tweet. In the analyses to follow, we will only be utilizing the column labeled tweet and the column labeled tweetid. 
+
+# Step 2) Clean Data
+
+The next step we need to take before we can implement topic modeling, or most text analysis, is we need to clean our text data. Notice in the snapshot of the tweets above there are numbers and letters that are not actual words (e.g., "U0001f3e0" in row 9). Therefore, we need to make sure that we remove any unwanted information from the text we plan to analyze.  Below, we provide a basic function that we name "textprocess" which manipulates the text in a few different ways to ensure the data is pre-processed or cleaned reasonably well. Note, this step in your data analysis may require additional or different data cleaning manipulations. These could be added to the textprocess function. The textprocess function uses the packages stringr [@R-stringr] and textclean [@R-textclean]. The text manipulations in the function are 1) the texts are first made lowercase, 2) punctuations are removed, 3) alphanumeric characters are removed, 4) symbols are removed, and 5) special characters are removed. In the last line of the code chunk, the function is  used on our column of tweets named tweet. The data is now processed, cleaned, and ready to use. 
+
+```{r,  eval=T}
+# cleaning strings function
+# the function executes a set of procedures on a set of texts
+textprocess <- function(texts = texts){
+  # import libraries
+  library(stringr)
+  library(textclean)
+  
+  # manipulate texts
+  texts = str_to_lower(texts) # tolower (1)
+  texts = gsub('[[:punct:] ]+',' ',texts) # remove punctuation (2)
+  texts = str_replace_all(texts, "[^[:alnum:]]", " ") # replace alphanumbers with space (3)
+  texts = strip(texts) # fnc to remove unwanted symbols (4)
+  texts = gsub(" *\\b(?<!-)\\w{1,2}(?!-)\\b *", " ", texts, perl=T) # removing any special characters (5)
+  
+  # return texts
+  texts
+}
+
+# clean data by running function
+tweets$tweet<- textprocess(texts = tweets$tweet)
+
+# display data
+tweets
+```
+
+Notice the changes in the tweet column of the data. No longer do we have punctuation, capital letters, or unwanted symbols. 
+
+# Step 3) Tokenizing data, Removing Stopwords, and Creating N-grams
+
+The next set of code shows us how to create N-grams after removing stopwords (stopwords are discussed below). The process of creating N-grams is way of tokenizing the data. That is, we are spliting the text into a set of tokens. These tokens could be 1-word, a pair of words, or an entire paragraph. Below, we show how to create 1-word tokens (unigrams) and pairs of words tokens (bigrams). The first step in the code is to tokenize the data into a set of words (unigrams). We accomplish this using the dyplr package and the tidytext package [@R-tidytext]. Using the object tweets, we call the unnest_tokens function by stating that we want to create a column of single words named "word" using the column of tweets. We specify that the tokens are n-grams of n=1. The resulting data are displayed below the code chunk.
+
+```{r,  warning = F, message = F, eval=T}
+library(dplyr)
+# tokenize data with unnest_tokens (1 word tokens)
+# we will create bigrams using the tokenized unigram data
+tweet_unigrams <- tweets %>%
+  tidytext::unnest_tokens(word, tweet, token = "ngrams", n =1)
+
+tweet_unigrams
+```
+
+
+Notice the words are now at the end of the tibble. We can see that there is now one word in every row and 43,753 words used in the entire set of cleaned tweets. The next step we take is to remove stopwords. Stopwords are words that are typically removed from the data before using natual language processing techinques. Stopwords include the most common words used in a language (e.g., the, is, or at). We also make the decision to remove a "custom_stop_word" that is equity (note if you wanted to include additional stopwords you could add them after "equity" like "equity", "word2"). We removed equity here because every tweet contained the word equity and, given we know these tweets are referring to equity, it adds nothing new to the our understanding of a given tweet. To remove stop words we again use the package called tidytext that contains the dictionary of stopwords. The stopwords are removed using the antijoin function from the dpylr package. The antijoin only keeps words that are not in the set of stopwords. 
+
+```{r,  warning = F, message = F, eval=T}
+# custom stopwords
+# note there is a default dictionary used here (see ?stop_words)
+library(tidytext)
+custom_stop_words_tweet <- bind_rows(data_frame(word = c("equity"), lexicon = c("custom")), stop_words)
+
+# remove stopwords
+tweet_unigrams_nostop <- tweet_unigrams %>%
+  anti_join(custom_stop_words_tweet)
+```
+
+The following figure shows the frequency of word or unigram use across the tweets. The data for the figure is filtered to only include words which were used greater than 60 times. We can see from the figure below that the top five words were diversity, market, inclusion, education, and nifty. **NOTE! When you run this workbook in R on your own, you may need to change the line of code below that states "filter(n > 60)." This is because, depending on the equity.csv dataset you create, you may or may not have 60 occurences of one word and may need to lower the n to a smaller number.**
+
+```{r, message=F}
+library(ggplot2)
+tweet_unigrams_nostop %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 450) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  ylab("Frequency") +
+  coord_flip()
+```
+
+To create bigrams, we use the set of unigrams with the stopwords removed. Using the object tweet_unigrams_nostop, we call the unnest_tokens function by stating we want to create a column of bigrams named "bigrams" using the column of word in the tweet_unigrams_nostop tibble. We specify that the tokens are n-grams of n=2. Lastly, we move the columns of word and bigram to the front of the dataframes using the indexing command [,c(7,1:6)]. This can be useful if you want to use the tweet attribute data in subsequent analysis. Otherwise, in the steps below, the data would be lost if the column of words and bigrams were kept at the end of the dataset or tibble.
+
+```{r,  warning = F, message = F, eval=T}
+# create bigrams from unigrams
+tweet_bigrams_nostop <- tweet_unigrams_nostop %>%
+  tidytext::unnest_tokens(bigram, word, token = "ngrams", n =2)
+
+# arrange first column to word
+# this is important for data to be carried forward in later 
+# analysis using the tidytext approach
+tweet_unigrams_nostop <- tweet_unigrams_nostop[,c(7,1:6)]
+tweet_bigrams_nostop <- tweet_bigrams_nostop[,c(7,1:6)]
+
+tweet_bigrams_nostop
+```
+
+We can see that the result is a tibble with 26, 244 bigrams on the rows. Note, for the remaining analysis we will only focus on the unigrams dataset. The analysis conducted below are possible with bigrams but are not shown here. The text cleaning process is vital to conducting any text analysis. Descriptive statistics on the text data can help spot anamolies or data that should be cleaned or removed. The user should take care to clean and tokenize their text data in whatever way that makes the most sense for their data. 
+
+# Step 4) Create Document-Term Matrix
+
+To conduct topic modeling with Latent Dirichlet Allocation (LDA) in the topicmodels package, we need to have our data in the form of a "DocumentTermMatrix." A Document Term Matrix (DTM), is a matrix that describes the fequency of words in the collection of documents (here tweets). In a DTM, the rows correspond to the documents in our collection of documents and the columns refer to the terms used across the documents. Again, we will utilize the dplyr and tidytext packages. The steps to create the document term matrix are 1) create a count of a specific word for a given document (tweet) and then sort them by the word with the largest frequency use, 2) create a count of the total number of words used by a given document (tweet), and 3) join the two counts by document together into one tibble or dataframe (tweet_unigrams_counts object below), and 4) cast the data using tidytext into a DTM with the function cast_dtm from the tidytext package. 
+
+```{r eval=T,warning=F, message=F }
+library(dplyr)
+library(tidytext)
+
+# counts words by id and sort by greatest n (1)
+tweet_unigrams_word_counts  <- tweet_unigrams_nostop %>%
+  count(tweetid, word, sort = TRUE) %>%
+  ungroup()
+
+# creating total words used by id (2)
+tweet_unigrams_total_counts <- tweet_unigrams_word_counts %>% 
+  group_by(tweetid) %>% 
+  summarize(total = sum(n))
+
+# joining two tables by id (3)
+tweet_unigrams_counts <- left_join(tweet_unigrams_word_counts, tweet_unigrams_total_counts)
+
+# cast into a Document-Term Matrix (4)
+tweet_unigrams_words_dtm <- tweet_unigrams_counts  %>%
+  tidytext::cast_dtm(tweetid, word, total)
+
+tweet_unigrams_words_dtm
+```
+
+The DTM contains data on 1,794 tweets and 9,403 unigrams. The matrix is very sparse (i.e., contains many zero). This is typical in text analysis. Note that the weighting of the DTM is term frequency (tf). Other weightings include term frequency inverse document frequency (tf-idf) but are not discussed here.
+
+# Step 5) LDA Tuning with ldatuning package
+
+The next set of code is not executed here because the function FindTopicsNumber takes a few minutes to run. The results of this function call to the data are reported in the main article. The FindTopicsNumber and FindTopicsNumber_plot functions are from the ldatuning package [@R-ldatuning]. The parameters of the function are discussed here breifly. For more information on the function, after loading the package ldatuning write ?FindTopicsNumber into the R console. The result of the FindTopicsNumber is saved to an object called result and this object is then used in the FindTopicsNumber_plot function that plots the results. The options or paramters of the FindTopicNumber function include 1) telling the function what the object is (here a document term matrix), 2) telling the function how many topic solutions to explore (here 2 to 16 by 2), 3) specify the metrics to compute (here only Arun2010 and Deveaud2014 are used - other options include Griffiths2004 and CaoJuan2009), 4) specify the estimation procedure (here gibbs), 5) specify a list of options to control the function (here we do not set a seed and set verbose to print the results as the function runs), 6) specify the number of cores on your machine, and 7) allow warnings to be reported by the function. Using the ldatuning package, we have a method that can help us determine the number of topics we should use in our LDA solution. 
+
+```{r, eval = F, include = T, echo=T}
+library(ldatuning)
+
+# fit methods for finding the number of topics using FindTopicsNumber Function
+# function is part of the ldatuning package
+# use ?FindTopicsNumber in console to examine function options
+result <- FindTopicsNumber(
+  dtm = tweet_unigrams_words_dtm, # data (1)
+  topics = seq(from = 2, to = 16, by = 2),# topics (2)
+  metrics = c("Arun2010", "Deveaud2014"), # metrics (3)
+  method = "Gibbs", # Using gibbs sampling (4)
+  control = list(seed = NA, verbose = 1), # setting seed (5)
+  mc.cores = 2, # use two cores (6)
+  verbose = TRUE # allows warnings (7)
+)
+
+# plot data
+FindTopicsNumber_plot(result)
+
+```
+
+
+# Step 6) Topic Modeling using LDA with topicmodels package
+
+To carryout topic modeling in R with LDA, we can use the topicmodels package. For more information on the topicmodels package, topic modeling, and LDA, the reader is encouraged to visit the {tidytextmining}(https://www.tidytextmining.com) website. In the demonstration below, the choice of two topics to discuss the code and functions is arbitrarily made. The four topic and eight topic solutions are also reported for investigation here. The four topic solution in discussed in the manuscript associated with this workbook. We use three packages to use LDA for topic modeling in R: ggplot2 [@R-ggplot2], dplyr, and topicmodels [@R-topicmodels]. 
+
+## Two-topic LDA
+
+In LDA, every document (tweet) is modeled as a mixture of topics and every topic as a mixture of words [@R-tidytext]. We fit the LDA model using the LDA function in the topicmodels package (see section 1 of the code chunk below). The LDA function takes as inputs the DTM, the estimation method (here we use the variational expectation-maximization method), and a list of controls. The LDA function and options are not discussed here but are discussed in the manuscript associated with this workbook. When using LDA, for each word and topic pair, a probability of belonging to a topic is estimated and stored in a matrix called beta (see section 2 of the code chunk below).Likewise, for each document and topic pair, a probability of belonging to a topic is estimated and stored in a matrix called gamma (see section 3 of the second code chunk below). We extract these matrices with the tidy function from tidytext. The beta matrix is visualized in the figure below the following code chunk. The figure is created by first organizing the beta tibble matrix by sorting the probabilities of words belonging to a topic by descending probability. Then we convert the topic to a factor and use ggplot2 to visualize the top 15 probabilities by topics. The components of the code for the ggplot2 figure code are not discussed here.
+
+```{r twotopic,message = F, warning=F, eval=T,include=T, echo=T, fig.cap="Word-Topic Probabilities", fig.align="center"}
+library(ggplot2)
+library(dplyr)
+library(topicmodels)
+
+# four topics unigram (1)
+tweet_unigrams_lda <- LDA(tweet_unigrams_words_dtm, method = "VEM", k = 2, control = list(seed = 1234, estimate.alpha = T, estimate.beta = T))
+
+# beta matrix P(word|topic) (2)
+tweet_word_topic <- tidy(tweet_unigrams_lda, matrix = "beta")
+
+# top terms
+tweet_lda_top_terms <- tweet_word_topic %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# covert to factor
+tweet_lda_top_terms$topic <- factor(tweet_lda_top_terms$topic)
+
+# plot top 15 Terms in each LDA topic
+tweet_lda_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  mutate(term = factor(paste(term, topic, sep = "__"), 
+                       levels = rev(paste(term, topic, sep = "__")))) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(labels = function(x) gsub("__.+$", "", x)) +
+  labs(title = "Top 15 terms in each of the two LDA topics",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free")
+```
+
+We can see from the figure above that the top five words for the first topic are diversity, inclusion, education, students, and amp. Also, we can see that the top five words for the second topic are market, stockmarket, nifty, stocks, and investments. The LDA appears to be separating the usage of equity across the tweets clearly by it's definition (i.e., either as a topic of the quality of being fair and impartial or as a topic of economic worth). 
+
+Likewise, we can visualize the topic by document probabilities (i.e., the gamma matrix). In the figure below the next code chunk, we see the distribution of the probabilities in gamma across all tweets Note, the y-axis is plotted on a log scale to make out the details of the plot.The plot indicates that the two topics were highly discriminating in terms of classifying the tweets. That is, we can see that the majority of the documents had gamma probabilities estimated as either a 0 or a 1. This finding indicates that the majority of tweets could be classified by the word usage given by the two topics. However, there were notably a number of tweets that had probabilities that were close to 0.5 indicating an even distribution of topic usage across the tweet. 
+
+```{r gammaall,message = F, warning=F, eval=T,include=T, echo=T, fig.cap="Document-Topic Probabilities", fig.align="center"}
+library(ggplot2)
+# gamma matrix P(topic|document) (3)
+tweet_topic_document <- tidy(tweet_unigrams_lda, matrix = "gamma")
+
+# Distribution of $\gamma$ for all Topics
+ggplot(tweet_topic_document, aes(gamma)) +
+  geom_histogram() +
+  scale_y_log10() +
+  labs(title = "Distribution of Probabilities across all Topics",
+       y = "Number of documents", x = expression(gamma))
+```
+
+We can also visualize the distribution of gamma probabilities across each topic. These are shown in the figure just below the next code chunk. Recall, each document has a topic classification. Therefore, documents with a probability of 0 on topic 1 have a probability of 1 on topic 2, and vice versa. We can see that within each topic, the probabilities appear to be slighltly skewed. The skew indicates that overall the tweets were more likely to belong to topic 2. That is, the tweets using the #equity were overall more likely to use equity in an economic sense.  
+
+```{r gammeach,message = F, warning=F, eval=T,include=T, echo=T, fig.cap="Document-Topic Probabilities", fig.align="center"}
+library(ggplot2)
+
+# Distribution of $\gamma$ for each Topic
+ggplot(tweet_topic_document, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_y_log10() +
+  labs(title = "Distribution of Probabilities across each Topic",
+       y = "Number of documents", x = expression(gamma))
+```
+
+We can examine a specific tweet based on it's gamma probability to see how the classification performed. For example, let us filter the tweets that had a probability greater than 0.95 on topic 1. 
+
+```{r}
+library(dplyr)
+
+# filter tweet great than 0.95 and topic equal to 1
+tweet_topic_document %>% filter(gamma > 0.95 & topic == 1)
+```
+
+Let's focus on document 1037. Note, this ID corresponds to the row number in the original equity.csv file. This is due to the nature of how the IDs were created in the first code chunk of this document. **NOTE! The code below will be commented out in the actual .RMD file. This is because you will be using your equity.csv file. Therefore, you need to supply that line of code with a document number from your equity.csv file**
+
+We can examine the tweet for this document by using the following code that subsets the tweet with ID 1037 from the original tweets dataframe. As the quote or tweet below demonstrates, the classification appear to work well here for this tweet that is about removing barriers to education for women facing uique challenges.
+
+```{r}
+tweets[tweets$tweetid == 1037, ]$tweet
+```
+
+# Conclusion
+
+In conclusion, from this LDA analysis with two-topics, we can see that the four-topic solution discussed in the  manuscript associated with this workbook allowed for more diversity in language use to be represented across the topics. In the manuscript associated with this workbook, the four topics were described as 1) equity as either economic or social-justice, 2) diversity for economic equity, 3) equity in an economic sense, and 4) equity in a social sense. However, we also see that the two-topic solution is capable of classifying documents by the language that they use fairly accurately based on the natural definition of equity. 
+
+# Appendix A) Additional Topic Solutions
+
+The code for the additional topic solutions can be found in the lda-workobook.Rmd file associated with this workbook. The results are simply reported here for the user to investigate.  
+
+## Four-topic LDA
+
+```{r tweetbeta4,message = F, warning=F, eval=T,include=T, echo=F, fig.align="center", fig.width=8, fig.height=6}
+library(ggplot2)
+library(dplyr)
+library(topicmodels)
+
+# four topics unigram
+tweet_unigrams_lda <- LDA(tweet_unigrams_words_dtm, method = "VEM", k = 4, control = list(seed = 1234, estimate.alpha = T, estimate.beta = T))
+
+# beta matrix P(word|topic)
+tweet_word_topic <- tidy(tweet_unigrams_lda, matrix = "beta")
+
+# gamma matrix P(topic|document)
+tweet_topic_document <- tidy(tweet_unigrams_lda, matrix = "gamma")
+
+# top terms
+tweet_lda_top_terms <- tweet_word_topic %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# covert to factor
+tweet_lda_top_terms$topic <- factor(tweet_lda_top_terms$topic)
+
+# plot top 15 Terms in each LDA topic
+tweet_lda_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  mutate(term = factor(paste(term, topic, sep = "__"), 
+                       levels = rev(paste(term, topic, sep = "__")))) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(labels = function(x) gsub("__.+$", "", x)) +
+  labs(title = "Top 15 terms in each LDA topic",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free")
+
+# Distribution of $\gamma$ for all Topics
+ggplot(tweet_topic_document, aes(gamma)) +
+  geom_histogram() +
+  scale_y_log10() +
+  labs(title = "Distribution of probabilities for all topics",
+       y = "Number of documents", x = expression(gamma))
+
+# Distribution of $\gamma$ for each Topic
+ggplot(tweet_topic_document, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_y_log10() +
+  labs(title = "Distribution of probability for each topic",
+       y = "Number of documents", x = expression(gamma))
+```
+
+## Eight topic LDA
+
+```{r tweetbeta8,message = F, warning=F, eval=T,include=T, echo=F, fig.align="center", fig.width=12, fig.height=12}
+library(ggplot2)
+library(dplyr)
+library(topicmodels)
+
+# four topics unigram
+tweet_unigrams_lda <- LDA(tweet_unigrams_words_dtm, method = "VEM", k = 8, control = list(seed = 1234))
+
+# beta matrix P(word|topic)
+tweet_word_topic <- tidy(tweet_unigrams_lda, matrix = "beta")
+
+# gamma matrix P(topic|document)
+tweet_topic_document <- tidy(tweet_unigrams_lda, matrix = "gamma")
+
+# top terms
+tweet_lda_top_terms <- tweet_word_topic %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# covert to factor
+tweet_lda_top_terms$topic <- factor(tweet_lda_top_terms$topic)
+
+# plot top 15 Terms in each LDA topic
+tweet_lda_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  mutate(term = factor(paste(term, topic, sep = "__"), 
+                       levels = rev(paste(term, topic, sep = "__")))) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(labels = function(x) gsub("__.+$", "", x)) +
+  labs(title = "Top 15 terms in each LDA topic",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free")
+
+# Distribution of $\gamma$ for all Topics
+ggplot(tweet_topic_document, aes(gamma)) +
+  geom_histogram() +
+  scale_y_log10() +
+  labs(title = "Distribution of probabilities for all topics",
+       y = "Number of documents", x = expression(gamma))
+
+# Distribution of $\gamma$ for each Topic
+ggplot(tweet_topic_document, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_y_log10() +
+  labs(title = "Distribution of probability for each topic",
+       y = "Number of documents", x = expression(gamma))
+```
+
+## Twelve topic LDA
+
+```{r tweetbeta12,message = F, warning=F, eval=T,include=T, echo=F, fig.align="center", fig.width=12, fig.height=12}
+library(ggplot2)
+library(dplyr)
+library(topicmodels)
+
+# four topics unigram
+tweet_unigrams_lda <- LDA(tweet_unigrams_words_dtm, method = "VEM", k = 12, control = list(seed = 1234))
+
+# beta matrix P(word|topic)
+tweet_word_topic <- tidy(tweet_unigrams_lda, matrix = "beta")
+
+# gamma matrix P(topic|document)
+tweet_topic_document <- tidy(tweet_unigrams_lda, matrix = "gamma")
+
+# top terms
+tweet_lda_top_terms <- tweet_word_topic %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# covert to factor
+tweet_lda_top_terms$topic <- factor(tweet_lda_top_terms$topic)
+
+# plot top 15 Terms in each LDA topic
+tweet_lda_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  mutate(term = factor(paste(term, topic, sep = "__"), 
+                       levels = rev(paste(term, topic, sep = "__")))) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(labels = function(x) gsub("__.+$", "", x)) +
+  labs(title = "Top 15 terms in each LDA topic",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free")
+
+# Distribution of $\gamma$ for all Topics
+ggplot(tweet_topic_document, aes(gamma)) +
+  geom_histogram() +
+  scale_y_log10() +
+  labs(title = "Distribution of probabilities for all topics",
+       y = "Number of documents", x = expression(gamma))
+
+# Distribution of $\gamma$ for each Topic
+ggplot(tweet_topic_document, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_y_log10() +
+  labs(title = "Distribution of probability for each topic",
+       y = "Number of documents", x = expression(gamma))
+```
+
+## Sixteen topic LDA
+
+```{r tweetbeta16,message = F, warning=F, eval=T,include=T, echo=F, fig.align="center", fig.width=12, fig.height=12}
+library(ggplot2)
+library(dplyr)
+library(topicmodels)
+
+# four topics unigram
+tweet_unigrams_lda <- LDA(tweet_unigrams_words_dtm, method = "VEM", k = 16, control = list(seed = 1234))
+
+# beta matrix P(word|topic)
+tweet_word_topic <- tidy(tweet_unigrams_lda, matrix = "beta")
+
+# gamma matrix P(topic|document)
+tweet_topic_document <- tidy(tweet_unigrams_lda, matrix = "gamma")
+
+# top terms
+tweet_lda_top_terms <- tweet_word_topic %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# covert to factor
+tweet_lda_top_terms$topic <- factor(tweet_lda_top_terms$topic)
+
+# plot top 15 Terms in each LDA topic
+tweet_lda_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  mutate(term = factor(paste(term, topic, sep = "__"), 
+                       levels = rev(paste(term, topic, sep = "__")))) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(labels = function(x) gsub("__.+$", "", x)) +
+  labs(title = "Top 15 terms in each LDA topic",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free")
+
+# Distribution of $\gamma$ for all Topics
+ggplot(tweet_topic_document, aes(gamma)) +
+  geom_histogram() +
+  scale_y_log10() +
+  labs(title = "Distribution of probabilities for all topics",
+       y = "Number of documents", x = expression(gamma))
+
+# Distribution of $\gamma$ for each Topic
+ggplot(tweet_topic_document, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_y_log10() +
+  labs(title = "Distribution of probability for each topic",
+       y = "Number of documents", x = expression(gamma))
+```
+
+# References
